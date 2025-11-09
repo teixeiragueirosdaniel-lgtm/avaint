@@ -1,0 +1,96 @@
+import streamlit as st
+import pandas as pd
+import ta
+import mplfinance as mpf
+from io import BytesIO
+import time
+
+st.set_page_config(page_title="Painel Avant Broker AI", layout="wide")
+st.title("Painel de Sinais - Avant Broker")
+
+# Entrada de arquivos CSV ou múltiplos ativos
+st.subheader("Carregue os dados do Avant Broker (CSV)")
+uploaded_files = st.file_uploader("Escolha um ou mais arquivos CSV", accept_multiple_files=True, type=['csv'])
+
+# Atualização automática
+atualizar = st.checkbox("Atualizar sinais automaticamente a cada 5 min", value=True)
+
+def calcular_sinais(dados):
+    dados['SMA20'] = dados['Close'].rolling(20).mean()
+    dados['SMA50'] = dados['Close'].rolling(50).mean()
+    dados['RSI'] = ta.momentum.RSIIndicator(dados['Close'], window=14).rsi()
+    macd = ta.trend.MACD(dados['Close'])
+    dados['MACD'] = macd.macd()
+    dados['MACD_signal'] = macd.macd_signal()
+    dados['PrevClose'] = dados['Close'].shift(1)
+
+    def sinal_candle(linha):
+        if linha['Close'] > linha['Open'] and linha['Open'] < linha['PrevClose']:
+            return 'COMPRA'
+        elif linha['Close'] < linha['Open'] and linha['Open'] > linha['PrevClose']:
+            return 'VENDA'
+        else:
+            return 'AGUARDAR'
+
+    dados['SinalCandle'] = dados.apply(sinal_candle, axis=1)
+
+    ultima = dados.iloc[-1]
+    compra = ultima['SMA20'] > ultima['SMA50'] and ultima['RSI'] < 70 and ultima['MACD'] > ultima['MACD_signal'] and ultima['SinalCandle'] == 'COMPRA'
+    venda = ultima['SMA20'] < ultima['SMA50'] and ultima['RSI'] > 30 and ultima['MACD'] < ultima['MACD_signal'] and ultima['SinalCandle'] == 'VENDA'
+
+    confiança = 0
+    if ultima['SMA20'] > ultima['SMA50']: confiança += 25
+    if ultima['RSI'] < 70: confiança += 25
+    if ultima['MACD'] > ultima['MACD_signal']: confiança += 25
+    if ultima['SinalCandle'] in ['COMPRA','VENDA']: confiança += 25
+
+    tempo = 5
+    if confiança > 80: tempo = 30
+    elif confiança > 60: tempo = 15
+
+    stop_loss = ultima['Close'] * 0.98 if compra else ultima['Close'] * 1.02
+    take_profit = ultima['Close'] * 1.02 if compra else ultima['Close'] * 0.98
+
+    acao = 'AGUARDAR'
+    if compra: acao = 'COMPRA'
+    elif venda: acao = 'VENDA'
+
+    return dados, acao, confiança, tempo, stop_loss, take_profit
+
+def mostrar_grafico(dados, acao, stop_loss, take_profit, ativo, confiança, tempo):
+    apds = [mpf.make_addplot(dados['SMA20'], color='orange'),
+            mpf.make_addplot(dados['SMA50'], color='green')]
+    mc = mpf.make_marketcolors(up='green', down='red', inherit=True)
+    s = mpf.make_mpf_style(marketcolors=mc)
+    fig, axlist = mpf.plot(dados, type='candle', style=s, addplot=apds, returnfig=True, figsize=(12,6))
+    ax = axlist[0]
+
+    if acao == 'COMPRA':
+        ax.scatter(dados.index[-1], dados['Close'][-1], color='green', s=100, label='Entrada COMPRA', zorder=5)
+    elif acao == 'VENDA':
+        ax.scatter(dados.index[-1], dados['Close'][-1], color='red', s=100, label='Entrada VENDA', zorder=5)
+
+    ax.hlines(stop_loss, xmin=dados.index[0], xmax=dados.index[-1], colors='red', linestyles='dashed', label='Stop Loss')
+    ax.hlines(take_profit, xmin=dados.index[0], xmax=dados.index[-1], colors='green', linestyles='dashed', label='Take Profit')
+    ax.set_title(f"{ativo} - Ação: {acao} | Confiança: {confiança}% | Tempo: {tempo} min")
+    ax.legend()
+    buf = BytesIO()
+    fig.savefig(buf, format='png')
+    st.image(buf)
+
+# Loop principal para múltiplos arquivos
+while True:
+    for file in uploaded_files:
+        ativo = file.name.split('.')[0]
+        dados = pd.read_csv(file)
+        dados.index = pd.to_datetime(dados['Date'])  # Supondo que CSV tenha coluna Date
+        dados, acao, confiança, tempo, stop_loss, take_profit = calcular_sinais(dados)
+        st.subheader(f"Ativo: {ativo}")
+        st.write(f"Ação sugerida: {acao}")
+        st.write(f"Confiança: {confiança}% | Duração: {tempo} min")
+        if acao != 'AGUARDAR':
+            st.write(f"Stop Loss: {stop_loss:.2f} | Take Profit: {take_profit:.2f}")
+        mostrar_grafico(dados, acao, stop_loss, take_profit, ativo, confiança, tempo)
+    if not atualizar:
+        break
+    time.sleep(300)  # Atualiza a cada 5 minutos
